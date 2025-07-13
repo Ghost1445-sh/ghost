@@ -3,7 +3,7 @@ import logging
 import random
 import json
 from urllib.parse import quote, unquote
-import asyncpg
+import aiosqlite  # asyncpg yerine aiosqlite eklendi
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -20,9 +20,10 @@ keep_alive()
 logging.basicConfig(level=logging.INFO)
 
 # --- CONFIGURATION ---
-API_TOKEN = '7790968356:AAGYEPi9cpgovtWmuzV98GYXjRAorWOIsGQ'
+API_TOKEN = '8023606164:AAECva1P972oDbn5_uB4S1LJRo4tE0Ipy2o'
 SUPER_ADMIN_ID = 7877979174
-DATABASE_URL = "postgresql://deezer:MPUyOunNCJVz9uOTrLYdPm1Y2LqkOnBz@dpg-d16r74fdiees73dgoukg-a/deezer_w9f6"
+# PostgreSQL DATABASE_URL yerine SQLite dosya yolu kullanılıyor
+DATABASE_FILE = "bot_database.db"
 # --- END CONFIGURATION ---
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -31,7 +32,7 @@ dp = Dispatcher(bot=bot, storage=storage)
 router = Router()
 dp.include_router(router)
 
-DB_POOL = None
+# DB_POOL kaldirildi
 # YENI: Aktiw söhbetdeşlikleri we kömek isleglerini yzarlamak üçin
 ACTIVE_CHATS = {}  # {user_id: admin_id}
 HELP_REQUESTS = {} # {user_id: [(admin_id, message_id), ...]}
@@ -66,43 +67,54 @@ class AdminStates(StatesGroup):
     waiting_for_addlist_url = State()
     waiting_for_addlist_name = State()
 
-async def init_db(pool):
-    async with pool.acquire() as connection:
-        await connection.execute("""
+# GÜNCELLENDİ: init_db fonksiyonu aiosqlite kullanacak şekilde yeniden yazıldı.
+async def init_db():
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        # PostgreSQL'deki SERIAL PRIMARY KEY, SQLite'de INTEGER PRIMARY KEY AUTOINCREMENT olarak değiştirildi.
+        # BIGINT, INTEGER olarak değiştirildi.
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT);
         """)
-        await connection.execute("""
-            CREATE TABLE IF NOT EXISTS channels (id SERIAL PRIMARY KEY, channel_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL);
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL);
         """)
-        await connection.execute("""
-            CREATE TABLE IF NOT EXISTS addlists (id SERIAL PRIMARY KEY, name TEXT NOT NULL, url TEXT UNIQUE NOT NULL);
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS addlists (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, url TEXT UNIQUE NOT NULL);
         """)
-        await connection.execute("""
-            CREATE TABLE IF NOT EXISTS vpn_configs (id SERIAL PRIMARY KEY, config_text TEXT UNIQUE NOT NULL);
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vpn_configs (id INTEGER PRIMARY KEY AUTOINCREMENT, config_text TEXT UNIQUE NOT NULL);
         """)
-        await connection.execute("""
-            CREATE TABLE IF NOT EXISTS bot_users (user_id BIGINT PRIMARY KEY);
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_users (user_id INTEGER PRIMARY KEY);
         """)
-        await connection.execute("""
-            CREATE TABLE IF NOT EXISTS bot_admins (user_id BIGINT PRIMARY KEY);
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_admins (user_id INTEGER PRIMARY KEY);
         """)
         default_welcome = "👋 <b>Hoş geldiňiz!</b>\n\nVPN Koduny almak üçin, aşakdaky Kanallara Agza boluň we soňra '✅ Agza Boldum' düwmesine basyň."
-        await connection.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING",
-            'welcome_message', default_welcome
+        # SQLite için uyumlu ON CONFLICT ifadesi kullanıldı
+        await db.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING",
+            ('welcome_message', default_welcome)
         )
+        await db.commit()
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def get_setting_from_db(key: str, default: str = None):
-    async with DB_POOL.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM bot_settings WHERE key = $1", key)
-        return row['value'] if row else default
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row['value'] if row else default
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def save_setting_to_db(key: str, value: str):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2",
-            key, value
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        # SQLite'in ON CONFLICT...DO UPDATE sözdizimi kullanıldı
+        await db.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value)
         )
+        await db.commit()
 
 async def save_last_mail_content(content: dict, keyboard: InlineKeyboardMarkup | None, mail_type: str):
     content_json = json.dumps(content)
@@ -151,11 +163,9 @@ async def send_mail_preview(chat_id: int, content: dict, keyboard: InlineKeyboar
         logging.error(f"Error sending mail preview to {chat_id}: {e}")
         return await bot.send_message(chat_id, f"⚠️ Gönderim hatası: {e}")
 
-# HATA DÜZELTMESİ: .caption_html -> .caption
 async def process_mailing_content(message: Message, state: FSMContext, mail_type: str):
     content = {}
     if message.photo:
-        # DÜZELTME: Hata düzeltildi, .caption_html yerine .caption kullanılıyor
         content = {'type': 'photo', 'file_id': message.photo[-1].file_id, 'caption': message.caption}
     elif message.text:
         content = {'type': 'text', 'text': message.html_text}
@@ -190,95 +200,131 @@ async def process_mailing_content(message: Message, state: FSMContext, mail_type
     target_state = AdminStates.waiting_for_mailing_confirmation if mail_type == "user" else AdminStates.waiting_for_channel_mailing_confirmation
     await state.set_state(target_state)
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def get_channels_from_db():
-    async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("SELECT channel_id, name FROM channels ORDER BY name")
-        return [{"id": row['channel_id'], "name": row['name']} for row in rows]
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT channel_id, name FROM channels ORDER BY name") as cursor:
+            rows = await cursor.fetchall()
+            return [{"id": row['channel_id'], "name": row['name']} for row in rows]
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def add_channel_to_db(channel_id: str, name: str):
-    async with DB_POOL.acquire() as conn:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
         try:
-            await conn.execute("INSERT INTO channels (channel_id, name) VALUES ($1, $2)", str(channel_id), name)
+            await db.execute("INSERT INTO channels (channel_id, name) VALUES (?, ?)", (str(channel_id), name))
+            await db.commit()
             return True
-        except asyncpg.UniqueViolationError:
+        except aiosqlite.IntegrityError:  # UNIQUE kısıtlama hatası için
             logging.warning(f"Channel {channel_id} already exists.")
             return False
         except Exception as e:
             logging.error(f"Error adding channel {channel_id} to DB: {e}")
             return False
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def delete_channel_from_db(channel_id: str):
-    async with DB_POOL.acquire() as conn:
-        result = await conn.execute("DELETE FROM channels WHERE channel_id = $1", str(channel_id))
-        return result != "DELETE 0"
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute("DELETE FROM channels WHERE channel_id = ?", (str(channel_id),))
+        await db.commit()
+        return cursor.rowcount > 0
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def get_addlists_from_db():
-    async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("SELECT id, name, url FROM addlists ORDER BY name")
-        return [{"db_id": row['id'], "name": row['name'], "url": row['url']} for row in rows]
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, name, url FROM addlists ORDER BY name") as cursor:
+            rows = await cursor.fetchall()
+            return [{"db_id": row['id'], "name": row['name'], "url": row['url']} for row in rows]
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def add_addlist_to_db(name: str, url: str):
-    async with DB_POOL.acquire() as conn:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
         try:
-            await conn.execute("INSERT INTO addlists (name, url) VALUES ($1, $2)", name, url)
+            await db.execute("INSERT INTO addlists (name, url) VALUES (?, ?)", (name, url))
+            await db.commit()
             return True
-        except asyncpg.UniqueViolationError:
+        except aiosqlite.IntegrityError:
             logging.warning(f"Addlist URL {url} already exists.")
             return False
         except Exception as e:
             logging.error(f"Error adding addlist {name} to DB: {e}")
             return False
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def delete_addlist_from_db(db_id: int):
-    async with DB_POOL.acquire() as conn:
-        result = await conn.execute("DELETE FROM addlists WHERE id = $1", db_id)
-        return result != "DELETE 0"
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute("DELETE FROM addlists WHERE id = ?", (db_id,))
+        await db.commit()
+        return cursor.rowcount > 0
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def get_vpn_configs_from_db():
-    async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("SELECT id, config_text FROM vpn_configs ORDER BY id")
-        return [{"db_id": row['id'], "config_text": row['config_text']} for row in rows]
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, config_text FROM vpn_configs ORDER BY id") as cursor:
+            rows = await cursor.fetchall()
+            return [{"db_id": row['id'], "config_text": row['config_text']} for row in rows]
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def add_vpn_config_to_db(config_text: str):
-    async with DB_POOL.acquire() as conn:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
         try:
-            await conn.execute("INSERT INTO vpn_configs (config_text) VALUES ($1)", config_text)
+            await db.execute("INSERT INTO vpn_configs (config_text) VALUES (?)", (config_text,))
+            await db.commit()
             return True
-        except asyncpg.UniqueViolationError:
+        except aiosqlite.IntegrityError:
             logging.warning(f"VPN config already exists.")
             return False
         except Exception as e:
             logging.error(f"Error adding VPN config to DB: {e}")
             return False
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def delete_vpn_config_from_db(db_id: int):
-    async with DB_POOL.acquire() as conn:
-        result = await conn.execute("DELETE FROM vpn_configs WHERE id = $1", db_id)
-        return result != "DELETE 0"
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute("DELETE FROM vpn_configs WHERE id = ?", (db_id,))
+        await db.commit()
+        return cursor.rowcount > 0
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def get_users_from_db():
-    async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM bot_users")
-        return [row['user_id'] for row in rows]
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        # row_factory burada gereksiz çünkü sadece bir sütun çekiliyor
+        async with db.execute("SELECT user_id FROM bot_users") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def add_user_to_db(user_id: int):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("INSERT INTO bot_users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        # ON CONFLICT DO NOTHING yerine INSERT OR IGNORE kullanıldı, SQLite için daha yaygındır
+        await db.execute("INSERT OR IGNORE INTO bot_users (user_id) VALUES (?)", (user_id,))
+        await db.commit()
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def get_admins_from_db():
-    async with DB_POOL.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id FROM bot_admins")
-        return [row['user_id'] for row in rows]
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        async with db.execute("SELECT user_id FROM bot_admins") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def add_admin_to_db(user_id: int):
-    async with DB_POOL.acquire() as conn:
-        await conn.execute("INSERT INTO bot_admins (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
-        return True
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        try:
+            await db.execute("INSERT INTO bot_admins (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False # Zaten admin
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 async def delete_admin_from_db(user_id: int):
-    async with DB_POOL.acquire() as conn:
-        result = await conn.execute("DELETE FROM bot_admins WHERE user_id = $1", user_id)
-        return result != "DELETE 0"
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cursor = await db.execute("DELETE FROM bot_admins WHERE user_id = ?", (user_id,))
+        await db.commit()
+        return cursor.rowcount > 0
 
 async def is_user_admin_in_db(user_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID:
@@ -365,7 +411,6 @@ async def start_command(message: types.Message, state: FSMContext):
             vpn_config_text = random.choice(vpn_configs)['config_text']
             await message.answer(f"✨ Agza bolanyňyz üçin sagboluň!\n\n🔑 <b>Siziň VPN Kodyňyz:</b>\n<pre><code>{vpn_config_text}</code></pre>")
 
-# HATA DÜZELTMESİ: .caption_html -> .caption
 @router.message(Command("help"))
 async def help_command(message: types.Message, state: FSMContext):
     await state.clear()
@@ -502,7 +547,6 @@ async def end_chat_command(message: Message, state: FSMContext):
                 pass
 
 
-# HATA DÜZELTMESİ: .caption_html -> .caption
 @router.message(ChatStates.in_chat)
 async def forward_chat_message(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -521,22 +565,22 @@ async def forward_chat_message(message: Message, state: FSMContext):
         if message.text:
             await bot.send_message(partner_id, f"{prefix}\n{message.html_text}")
         elif message.photo:
-            caption = f"{prefix}\n{message.caption or ''}" # DÜZELTME
+            caption = f"{prefix}\n{message.caption or ''}"
             await bot.send_photo(partner_id, message.photo[-1].file_id, caption=caption)
         elif message.video:
-            caption = f"{prefix}\n{message.caption or ''}" # DÜZELTME
+            caption = f"{prefix}\n{message.caption or ''}"
             await bot.send_video(partner_id, message.video.file_id, caption=caption)
         elif message.animation:
-            caption = f"{prefix}\n{message.caption or ''}" # DÜZELTME
+            caption = f"{prefix}\n{message.caption or ''}"
             await bot.send_animation(partner_id, message.animation.file_id, caption=caption)
         elif message.audio:
-            caption = f"{prefix}\n{message.caption or ''}" # DÜZELTME
+            caption = f"{prefix}\n{message.caption or ''}"
             await bot.send_audio(partner_id, message.audio.file_id, caption=caption)
         elif message.voice:
-            caption = f"{prefix}\n{message.caption or ''}" # DÜZELTME
+            caption = f"{prefix}\n{message.caption or ''}"
             await bot.send_voice(partner_id, message.voice.file_id, caption=caption)
         elif message.document:
-            caption = f"{prefix}\n{message.caption or ''}" # DÜZELTME
+            caption = f"{prefix}\n{message.caption or ''}"
             await bot.send_document(partner_id, message.document.file_id, caption=caption)
         else:
             await message.copy_to(partner_id)
@@ -573,16 +617,23 @@ async def exit_admin_panel_handler(callback: types.CallbackQuery, state: FSMCont
         await callback.message.answer("✅ Siz admin panelden çykdyňyz.")
     await callback.answer()
 
+# GÜNCELLENDİ: aiosqlite kullanacak şekilde yeniden yazıldı
 @router.callback_query(lambda c: c.data == "get_stats")
 async def get_statistics(callback: types.CallbackQuery):
     if not await is_user_admin_in_db(callback.from_user.id):
         return await callback.answer("⛔ Giriş gadagan.", show_alert=True)
-    async with DB_POOL.acquire() as conn:
-        user_count = await conn.fetchval("SELECT COUNT(*) FROM bot_users")
-        channel_count = await conn.fetchval("SELECT COUNT(*) FROM channels")
-        addlist_count = await conn.fetchval("SELECT COUNT(*) FROM addlists")
-        vpn_count = await conn.fetchval("SELECT COUNT(*) FROM vpn_configs")
-        admin_count = await conn.fetchval("SELECT COUNT(*) FROM bot_admins")
+    
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        async with db.execute("SELECT COUNT(*) FROM bot_users") as cursor:
+            user_count = (await cursor.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM channels") as cursor:
+            channel_count = (await cursor.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM addlists") as cursor:
+            addlist_count = (await cursor.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM vpn_configs") as cursor:
+            vpn_count = (await cursor.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM bot_admins") as cursor:
+            admin_count = (await cursor.fetchone())[0]
 
     status_description = "Bot işleýär" if vpn_count > 0 else "VPN KODLARY ÝOK!"
     alert_text = (f"📊 Bot statistikasy:\n"
@@ -1247,26 +1298,18 @@ async def process_check_subscription(callback: types.CallbackQuery, state: FSMCo
         
         await callback.answer(text="⚠️ Haýyş edýäris, sanawdaky ähli ýerlere agza boluň!", show_alert=True)
 
+# GÜNCELLENDİ: main fonksiyonu aiosqlite kullanacak şekilde basitleştirildi
 async def main():
-    global DB_POOL
     try:
-        DB_POOL = await asyncpg.create_pool(dsn=DATABASE_URL)
-        if DB_POOL:
-            logging.info("Successfully connected to PostgreSQL and connection pool created.")
-            await init_db(DB_POOL)
-            logging.info("Database initialized.")
-        else:
-            logging.error("Failed to create database connection pool.")
-            return
+        # SQLite veritabanını başlat
+        await init_db()
+        logging.info("Database initialized successfully.")
     except Exception as e:
-        logging.critical(f"Failed to connect to PostgreSQL or initialize database: {e}")
+        logging.critical(f"Failed to initialize SQLite database: {e}")
         return
 
     await dp.start_polling(bot)
 
-    if DB_POOL:
-        await DB_POOL.close()
-        logging.info("PostgreSQL connection pool closed.")
 
 if __name__ == '__main__':
     asyncio.run(main())
